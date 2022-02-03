@@ -1,0 +1,482 @@
+---
+# Managed Pipelines for Code Suite
+#
+# Version 0.0.0.0
+#
+# Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: "env-manualupdate"
+
+Parameters:
+  org:
+    Type: "String"
+    Default: "default"
+    Description: "The organization that owns this environment. E.g. 'aws'"
+  product:
+    Type: "String"
+    Default: "SomeProduct"
+    Description: "The product that for which we will be tracking deployment"
+  sourceEnv:
+    Type: "String"
+    Default: "SomeEnv"
+    Description: "The name of the source environment"
+  targetEnv:
+    Type: "String"
+    Default: "SomeEnv"
+    Description: "The name of the targeted environment"
+  deploymentFilename:
+    Type: "String"
+    Description: "The Deployment File name"
+  branchName:
+    Type: "String"
+    Default: "master"
+    Description: "The destination repository branch to commit the change"
+  BitBucketWorkspace:
+    Type: String
+    Description: BitBucket workspace name
+    Default: myworkspace
+  BitBucketCredentialSecret:
+    Type: String
+    Description: ARN of BitBucket secrets in Secrets Manager
+  notificationEmail:
+    Type: "String"
+    Description: "The email address that codepipeline will publish notification for approval to"
+
+Resources:
+
+  # BitBucket source connection
+  BitBucketConnection:
+    Type: "AWS::CodeStarConnections::Connection"
+    Properties:
+      ConnectionName: !Sub "${org}-${product}-${targetEnv}"
+      ProviderType: "Bitbucket"
+      Tags:
+        - Key: "mpcs-version"
+          Value: "0.0.0.0"
+        - Key: "org"
+          Value: !Ref "org"
+        - Key: "product"
+          Value: !Ref "product"
+        - Key: "env"
+          Value: !Ref "targetEnv"
+
+  #
+  # CodeBuild
+  #
+
+  CodeBuildLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Sub "${org}-env-${targetEnv}-${product}-manualupdate"
+      RetentionInDays: 7
+
+  CodeBuildServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${org}-env-${targetEnv}-${product}-manualupdate-codebuild-service"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Tags:
+        - Key: "mpcs-version"
+          Value: "0.0.0.0"
+        - Key: "org"
+          Value: !Ref "org"
+        - Key: "product"
+          Value: !Ref "product"
+        - Key: "env"
+          Value: !Ref "targetEnv"
+
+  CodeBuildServicePolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub "${org}-env-${targetEnv}-${product}-manualupdate-codebuild-service"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "WriteLogs"
+            Effect: "Allow"
+            Action:
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - !GetAtt "CodeBuildLogGroup.Arn"
+              - !Join
+                - ""
+                - - !GetAtt "CodeBuildLogGroup.Arn"
+                  - ":*"
+          - Sid: "ReadArtifactRepoBucket"
+            Effect: "Allow"
+            Action:
+              - "s3:GetBucketAcl"
+              - "s3:GetBucketLocation"
+              - "s3:GetObject"
+              - "s3:ListBucket"
+            Resource:
+              - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - !ImportValue "aws-mpcs-artifact-repo-bucket-name"
+              - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - !ImportValue "aws-mpcs-artifact-repo-bucket-name"
+                    - "/*"
+          - Sid: "AccessCodeStarConnection"
+            Effect: "Allow"
+            Action: "codestar-connections:UseConnection"
+            Resource: !Ref "BitBucketConnection"
+          - Sid: "ReadWriteTempBucket"
+            Effect: "Allow"
+            Action:
+              - "s3:GetBucketAcl"
+              - "s3:GetBucketLocation"
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+              - "s3:PutObject"
+            Resource:
+              - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - !ImportValue "aws-mpcs-temp-bucket-name"
+                    - "*"
+          - Effect: Allow
+            Action:
+              - secretsmanager:DescribeSecret
+              - secretsmanager:GetSecretValue
+            Resource:
+              - !Ref BitBucketCredentialSecret
+      Roles:
+        - !Ref "CodeBuildServiceRole"
+
+  Deploy:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${org}-env-${targetEnv}-${product}-manualupdate"
+      ServiceRole: !GetAtt "CodeBuildServiceRole.Arn"
+      Source:
+        Type: "CODEPIPELINE"
+        BuildSpec: |
+          version: 0.2
+          env:
+            git-credential-helper: "yes"
+          phases:
+            build:
+              commands:
+                - git branch -a | grep UpdateFromCodebuild; exist=$?;
+                - if [ $exist = 0 ]; then git checkout UpdateFromCodebuild; else git checkout -b UpdateFromCodebuild; fi
+                - updatedversion=$(cat $CODEBUILD_SRC_DIR_source2/${DEPLOYMENT_FILE_NAME} | grep version |  awk '{ print $2 }')
+                - sourceversion=$(cat ${DEPLOYMENT_FILE_NAME} | grep version | awk '{ print $2 }')
+                - sed -i "s/$sourceversion/$updatedversion/g" ${DEPLOYMENT_FILE_NAME}
+                - git config --global user.email "codebuild@local"
+                - git config --global user.name "Codebuild"
+                - git add ${DEPLOYMENT_FILE_NAME}
+                - git commit -m "Update to Version $updatedversion by manual deploy pipeline"
+                - git push origin UpdateFromCodebuild
+                - username=$(aws secretsmanager get-secret-value --secret-id bitbucket | jq --raw-output .SecretString | jq -r ."username")
+                - password=$(aws secretsmanager get-secret-value --secret-id bitbucket | jq --raw-output .SecretString | jq -r ."token")
+                - |
+                  curl https://api.bitbucket.org/2.0/repositories/${WORKSPACE}/${ORG}-${PRODUCT}-env-${TARGET_ENV}/pullrequests \
+                    -u $username:$password \
+                    --request POST \
+                    --header 'Content-Type: application/json' \
+                    --data '{
+                      "title": "UpdateFromCodebuild",
+                      "source": {
+                        "branch": {
+                          "name": "UpdateFromCodebuild"
+                        },
+                        "close_source_branch": true
+                      }
+                    }'
+      #Create secondary source and put the different source identifiers. 
+      #In this example the source codes will be stored in CODEBUILD_SRC_DIR_source1 and CODEBUILD_SRC_DIR_source2 folders.
+      SecondarySources:
+        - Type: "BITBUCKET"
+          Location: !Sub "https://bitbucket.org/${BitBucketWorkspace}/${org}-${product}-env-${targetEnv}.git"
+          SourceIdentifier: "source1"
+        - Type: "BITBUCKET"
+          Location: !Sub "https://bitbucket.org/${BitBucketWorkspace}/${org}-${product}-env-${sourceEnv}.git"
+          SourceIdentifier: "source2"
+      Environment:
+        Type: "LINUX_CONTAINER"
+        ComputeType: "BUILD_GENERAL1_SMALL"
+        Image: "aws/codebuild/amazonlinux2-x86_64-standard:3.0"
+        EnvironmentVariables:
+          - Name: "ARTIFACT_REPO_BUCKET_NAME"
+            Type: "PLAINTEXT"
+            Value:
+              !ImportValue "aws-mpcs-artifact-repo-bucket-name"
+          - Name: "DEPLOYMENT_FILE_NAME"
+            Type: "PLAINTEXT"
+            Value:
+              !Ref "deploymentFilename"
+          - Name: "BRANCH_NAME"
+            Type: "PLAINTEXT"
+            Value:
+              !Ref "branchName"
+          - Name: "WORKSPACE"
+            Type: "PLAINTEXT"
+            Value:
+              !Ref "BitBucketWorkspace"
+          - Name: "ORG"
+            Type: "PLAINTEXT"
+            Value:
+              !Ref "org"
+          - Name: "PRODUCT"
+            Type: "PLAINTEXT"
+            Value:
+              !Ref "product"
+          - Name: "TARGET_ENV"
+            Type: "PLAINTEXT"
+            Value:
+              !Ref "targetEnv"
+      Cache:
+        Type: "S3"
+        Location:
+          Fn::Join:
+            - ""
+            - - !ImportValue "aws-mpcs-temp-bucket-name"
+              - "/cache"
+        Modes:
+          - "LOCAL_CUSTOM_CACHE"
+      Artifacts:
+        Type: "CODEPIPELINE"
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref "CodeBuildLogGroup"
+          StreamName: !Sub "${org}-env-${targetEnv}-${product}-manualupdate"
+          Status: "ENABLED"
+      Tags:
+        - Key: "mpcs-version"
+          Value: "0.0.0.0"
+        - Key: "org"
+          Value: !Ref "org"
+        - Key: "product"
+          Value: !Ref "product"
+        - Key: "env"
+          Value: !Ref "targetEnv"
+
+# CodePipeline
+  PipelineServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${org}-${product}-${targetEnv}-maunal-deployment-codepipeline-service"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Ref "PipelineServicePolicy"
+      Tags:
+        - Key: "mpcs-version"
+          Value: "0.0.0.0"
+        - Key: "org"
+          Value: !Ref "org"
+        - Key: "product"
+          Value: !Ref "product"
+        - Key: "env"
+          Value: !Ref "targetEnv"
+
+  PipelineServicePolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: !Sub "${org}-${product}-${targetEnv}-maunal-deployment-codepipeline-service"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "ReadWriteTempBucket"
+            Effect: "Allow"
+            Action:
+              - "s3:GetBucketAcl"
+              - "s3:GetBucketLocation"
+              - "s3:GetObject"
+              - "s3:GetObjectVersion"
+              - "s3:PutObject"
+            Resource:
+              - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - !ImportValue "aws-mpcs-temp-bucket-name"
+              - Fn::Join:
+                  - ""
+                  - - "arn:aws:s3:::"
+                    - !ImportValue "aws-mpcs-temp-bucket-name"
+                    - "/*"
+          - Sid: "WriteCodeBuild"
+            Effect: "Allow"
+            Action:
+              - "codebuild:BatchGetBuilds"
+              - "codebuild:StartBuild"
+            Resource:
+              - !GetAtt "Deploy.Arn"
+          - Sid: "AccessCodeStarConnection"
+            Effect: "Allow"
+            Action: "codestar-connections:UseConnection"
+            Resource: !Ref "BitBucketConnection"
+          - Sid: "PublishApprovalSNS"
+            Effect: "Allow"
+            Action:
+              - "sns:Publish"
+            Resource:
+              - !Ref ReleaseApprovalSNS
+
+  Pipeline:
+    Type: "AWS::CodePipeline::Pipeline"
+    Properties:
+      Name: !Sub "${org}-env-${targetEnv}-${product}-manualupdate"
+      RoleArn: !GetAtt "PipelineServiceRole.Arn"
+      Stages:
+        - Name: "Source"
+          Actions:
+            - Name: "Source"
+              ActionTypeId:
+                Category: "Source"
+                Provider: "CodeStarSourceConnection"
+                Version: "1"
+                Owner: "AWS"
+              OutputArtifacts:
+                - Name: "SourceOutput"
+              Configuration:
+                ConnectionArn: !Ref "BitBucketConnection"
+                FullRepositoryId: !Sub "${BitBucketWorkspace}/${org}-${product}-env-${targetEnv}"
+                BranchName: !Ref "branchName"
+                DetectChanges: false
+                OutputArtifactFormat: CODEBUILD_CLONE_REF
+              RunOrder: 1
+        - Name: "DeploymentApproval"
+          Actions:
+            - Name: "DeploymentApproval"
+              ActionTypeId:
+                Category: "Approval"
+                Provider: "Manual"
+                Version: "1"
+                Owner: "AWS"
+              Configuration:
+                NotificationArn: !Ref ReleaseApprovalSNS
+                CustomData: !Sub "Promote build from ${sourceEnv} to ${targetEnv}"
+        - Name: "Deploy"
+          Actions:
+            - Name: "Deploy"
+              ActionTypeId:
+                Category: "Build"
+                Provider: "CodeBuild"
+                Version: "1"
+                Owner: "AWS"
+              InputArtifacts:
+                - Name: "SourceOutput"
+              Configuration:
+                ProjectName: !Ref "Deploy"
+                PrimarySource: "SourceInput"
+      ArtifactStore:
+        Type: "S3"
+        Location:
+          !ImportValue "aws-mpcs-temp-bucket-name"
+      Tags:
+        - Key: "mpcs-version"
+          Value: "0.0.0.0"
+        - Key: "org"
+          Value: !Ref "org"
+        - Key: "product"
+          Value: !Ref "product"
+        - Key: "env"
+          Value: !Ref "targetEnv"
+# BuildTriggerPolicy
+  #
+  # IAM Policy for BuildTriggerRole which grants the ability to start the pipeline.
+  BuildTriggerPolicy:
+    Type: "AWS::IAM::Policy"
+    Properties:
+      PolicyName: !Sub "${org}-${product}-${targetEnv}-buildtrigger"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Action:
+              - "codepipeline:StartPipelineExecution"
+            Resource:
+              - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${org}-env-${targetEnv}-${product}-manualupdate"
+      Roles:
+        - !Ref "BuildTriggerRole"
+
+# BuildTriggerRole
+  #
+  # IAM Role for the BuildTriggerRule to use to access the CodeCommit repository
+  BuildTriggerRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub "${org}-${product}-${targetEnv}-buildtrigger"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "events.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Tags:
+        - Key: "mpcs-version"
+          Value: "0.0.0.0"
+        - Key: "org"
+          Value: !Ref "org"
+        - Key: "product"
+          Value: !Ref "product"
+        - Key: "env"
+          Value: !Ref "targetEnv"
+
+  #
+  # Manual TriggerRule
+  #
+  # A CloudWatch Events Rule that triggers the CodePipeline for each new commit to the CodeCommit repository.
+  ManualTriggerRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Name: !Sub "${org}-env-${sourceEnv}-to-${targetEnv}-${product}-TriggerRule"
+      EventPattern:
+        Fn::Join:
+          - ""
+          - - "{"
+            - "\"source\": ["
+            - "\"aws.codepipeline\""
+            - "],"
+            - "\"resources\": [{"
+            - "\""
+            - !Sub prefix":"arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${org}-${product}-env-${sourceEnv}-deploy
+            - "\""
+            - "}],"
+            - "\"detail-type\": ["
+            - "\"CodePipeline Pipeline Execution State Change\""
+            - "],"
+            - "\"detail\": {"
+            - "\"state\": ["
+            - " \"SUCCEEDED\" ]"
+            - "}"
+            - "}"
+      State: "ENABLED"
+      Targets:
+        - Id: !Sub "${org}-env-${sourceEnv}-to-${targetEnv}-${product}"
+          Arn: !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${org}-env-${targetEnv}-${product}-manualupdate"
+          RoleArn: !GetAtt "BuildTriggerRole.Arn"
+
+  # SNS topic for sending email when approval is needed
+  ReleaseApprovalSNS:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref "notificationEmail"
+          Protocol: "email"
+      TopicName: !Sub "${org}-${product}-${sourceEnv}-${targetEnv}-releaseapprovalsns"
